@@ -13,8 +13,26 @@ from torch.utils.data import Dataset, DataLoader
 
 from creadtonlp.models.gan import Generator, Discriminator
 
-
-def train(n_epochs=20000, batch_size=8, save_period=20, lr_g=0.0002, betas_g=(0.5, 0.999), lr_d=0.0002, betas_d=(0.5, 0.999)):
+def test(generator_path: str, prompt: str, save_path: str = "./"):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    generator = Generator(512, [3, 64, 64]).to(device)
+    gen_weight = torch.load(generator_path)
+    generator.load_state_dict(gen_weight)
+    generator.eval()
+    clip_model, _ = clip.load("ViT-B/32", device=device)
+    
+    inv_trans = transforms.Compose([transforms.Normalize([0], [1/0.5]),
+                                   transforms.Normalize([-0.5], [1])])
+    
+    with torch.no_grad():
+        text_tokens = clip.tokenize(prompt).to(device)
+        text_embeddings = clip_model.encode_text(text_tokens).to(torch.float32)
+        sample_image = inv_trans(generator(text_embeddings)).squeeze().detach().cpu()
+        sample_image = sample_image.mul(255).clamp(0, 255).byte().permute(1, 2, 0).numpy()
+        pil_image = Image.fromarray(sample_image)
+        pil_image.save(os.path.join(save_path, "inference_image.png"))
+        
+def train(n_epochs=20000, batch_size=8, save_period=5, lr_g=0.0002, betas_g=(0.5, 0.999), lr_d=0.0002, betas_d=(0.5, 0.999)):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     loader, sample = get_loader(batch_size=batch_size, device=device)
     sample_emb, real_img = sample
@@ -61,7 +79,7 @@ def train(n_epochs=20000, batch_size=8, save_period=20, lr_g=0.0002, betas_g=(0.
 def save_samples(path: str, *images):
     from torchvision.utils import make_grid
     inv_trans = transforms.Compose([transforms.Normalize([0], [1/0.5]),
-                                   transforms.Normalize([0], [1/0.5])])
+                                   transforms.Normalize([-0.5], [1])])
 
     for index, image in enumerate(images):
         grid = make_grid(inv_trans(image.detach().cpu()), nrow=3)
@@ -81,14 +99,29 @@ def get_loader(batch_size: int, device: Optional[torch.device | str]):
     dataset = CelebADataset(attr_path=r"../datasets/celeba-dataset/list_attr_celeba.csv",
                             img_root=r"../datasets/celeba-dataset/img_align_celeba/img_align_celeba",
                             transform=transform, device=device)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     sample = next(iter(dataloader))
     return dataloader, sample
 
 
 class CelebADataset(Dataset):
     def __init__(self, attr_path: str, img_root: str, transform=None, device="cuda"):
+        self.device = torch.device(device)
+        self.clip_model, self.clip_processor = clip.load("ViT-B/32", device=device)
+        
         whole_frame = pd.read_csv(attr_path)
+        attr_frame = whole_frame.drop(columns=['image_id'])
+        self.x = []
+        for index, row in attr_frame.iterrows():
+            print(index)
+            attrs = []
+            for col in attr_frame.columns:
+                if row[col] >= 0:
+                    attrs.append(col.replace('_', ' '))
+            attrs = ", ".join(attrs)
+            embeddings = self.get_embeddings(attrs, model=self.clip_model)
+            self.x.append(embeddings.squeeze().cpu().detach().clone())
+            
         self.y = []
         image_series = whole_frame['image_id']
         for value in tqdm(image_series):
@@ -96,26 +129,12 @@ class CelebADataset(Dataset):
             img = Image.open(full_path)
             img = transform(img) if transform is not None else img
             self.y.append(img)
-
-        attr_frame = whole_frame.drop(columns=['image_id'])
-        self.x = []
-        for index, row in attr_frame.iterrows():
-            attrs = []
-            for col in attr_frame.columns:
-                if row[col] >= 0:
-                    attrs.append(col.replace('_', ' '))
-            attrs = ", ".join(attrs)
-            self.x.append(attrs)
-
-        self.device = torch.device(device)
-        self.clip_model, self.clip_processor = clip.load("ViT-B/32", device=self.device)
-        
+       
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, index):
-        embeddings = self.get_embeddings(self.x[index], model=self.clip_model)
-        return embeddings.squeeze().to(self.device), self.y[index].to(self.device)
+        return self.x[index].to(self.device), self.y[index].to(self.device)
 
     def get_embeddings(self, texts, model, device="cuda"):
         text_tokens = clip.tokenize(texts).to(device)
@@ -123,4 +142,7 @@ class CelebADataset(Dataset):
         return text_embeddings.to(torch.float32)
 
 if __name__ == "__main__":
-    train()
+    # train()
+    test(generator_path=r"./outputs/cgan-celeba/000250/generator_epoch_000250.pth",
+         prompt=["Bangs, Blond Hair, Chubby, Arched Eyebrows, Sideburns, Wavy Hair, Wearing Necklace"],
+         save_path="./")
